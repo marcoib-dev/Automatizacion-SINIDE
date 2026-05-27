@@ -1,0 +1,26 @@
+{
+  "excel_path": "data/notas_colegio.xlsx",
+  "columna_alumnos": "NOMBRE ALUMNO",
+  "mapeo_materias": {
+    "CIENCIAS NATURALES": "Naturales",
+    "CIENCIAS SOCIALES": "Cs Sociales",
+    "EDUCACIÓN FÍSICA": "Educ Fisica",
+    "EDUCACIÓN PLÁSTICA": "Plastica",
+    "FORMACIÓN ÉTICA Y CIUDADANA": "Etica",
+    "LENGUA": "Lengua",
+    "MATEMÁTICA": "Matematica",
+    "MÚSICA": "Musica",
+    "TECNOLOGÍA": "Tecnologia"
+  },
+  "selenium": {
+    "timeout_segundos": 10,
+    "selectores": {
+      "tabla_alumnos": "//table[@class='ui-table-textbox']",
+      "fila_alumno": ".//tr[contains(@class, 'ui-widget-content')]",
+      "celda_nombre": ".//td[1]",
+      "celda_nota_1t": ".//td[2]/input",
+      "desplegable_materia": "//button[contains(@class, 'ui-dropdown-trigger')]",
+      "opciones_materia": "//li[contains(@class, 'ui-dropdown-item')]"
+    }
+  }
+}
