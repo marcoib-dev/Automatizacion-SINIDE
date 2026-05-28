@@ -1,20 +1,30 @@
-"""web_handler.py
------------------
-Módulo para interactuar con la interfaz web de SINIDE usando Selenium.
+"""
+web_handler.py
+--------------
+Controla la interfaz web de SINIDE desde dentro del iframe AngularJS.
 
-La estrategia del handler es conectarse a una sesión ya abierta de Brave
-mediante remote debugging en el puerto 9222, y operar sobre la tabla de
-alumnos usando selectores declarados en ``config.json``.
+Puntos clave del HTML real:
+  - Todo el formulario vive en un <iframe src="/ui/index.html">
+  - Los dropdowns son Bootstrap: button.dropdown-toggle + ul.dropdown-menu li a span
+  - La celda de nota muestra un <span>S/C</span> hasta que se hace clic,
+    momento en que AngularJS lo reemplaza por un <input>
+  - IDs de los dropdowns: #calificaciones-materias-selector, #periodo-notas-selector
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
@@ -23,227 +33,281 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 from excel_reader import CONFIG_PATH, load_config
 
-
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-	level=logging.INFO,
-	format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
 
+GradeResolver = Callable[[str], Optional[str]]
 
-GradeResolver = Callable[[str], Optional[object]]
+_DROPDOWN_SETTLE = 1.2   # segundos tras seleccionar en un dropdown
+_TABLE_SETTLE    = 1.5   # segundos tras cambiar materia/trimestre
 
 
 class WebHandler:
-	"""Controla la carga de notas en la tabla web de SINIDE.
+    """Interactúa con la tabla de calificaciones de SINIDE (dentro del iframe)."""
 
-	Example:
-		>>> from excel_reader import ExcelReader
-		>>> excel = ExcelReader()
-		>>> excel.load_sheet("Hoja1")
-		>>> handler = WebHandler()
-		>>> handler.sync_grades(lambda student: excel.get_grade(student, "CIENCIAS NATURALES"))
-	"""
+    def __init__(
+        self,
+        config_path: Path = CONFIG_PATH,
+        driver: Optional[webdriver.Chrome] = None,
+    ) -> None:
+        self.config    = load_config(config_path)
+        sel_cfg        = self.config.get("selenium", {})
+        self.timeout   = int(sel_cfg.get("timeout_segundos", 15))
+        self.sel       = sel_cfg.get("selectores", {})
 
-	def __init__(self, config_path: Path = CONFIG_PATH, driver: Optional[webdriver.Chrome] = None) -> None:
-		"""Inicializa el handler y se conecta al Brave ya abierto.
+        self.driver = driver or self._create_driver()
+        self.wait   = WebDriverWait(self.driver, self.timeout)
 
-		Args:
-			config_path: Ruta al archivo ``config.json`` de la raíz del proyecto.
-			driver: Instancia de WebDriver opcional para inyectar desde tests.
+        logger.info("WebHandler conectado. Entrando al iframe...")
+        self._switch_to_iframe()
+        logger.info("Contexto dentro del iframe establecido.")
 
-		Raises:
-			KeyError: Si faltan claves de Selenium en el JSON.
-			TimeoutException: Si la tabla no está disponible al inicializar.
-		"""
-		self.config = load_config(config_path)
+    # ------------------------------------------------------------------
+    # Ciclo de vida
+    # ------------------------------------------------------------------
 
-		selenium_config = self.config.get("selenium")
-		if not selenium_config:
-			raise KeyError("Falta la sección 'selenium' en config.json.")
+    def close(self) -> None:
+        if self.driver:
+            self.driver.quit()
 
-		self.timeout: int = int(selenium_config.get("timeout_segundos", 10))
-		self.selectors: dict[str, str] = selenium_config.get("selectores", {})
+    def __enter__(self) -> "WebHandler":
+        return self
 
-		required_selectors = {"tabla_alumnos", "fila_alumno", "celda_nombre", "celda_nota_1t"}
-		missing_selectors = required_selectors - self.selectors.keys()
-		if missing_selectors:
-			raise KeyError(f"Faltan selectores obligatorios en config.json: {missing_selectors}")
+    def __exit__(self, *_) -> None:
+        self.close()
 
-		self.driver: webdriver.Chrome = driver or self._create_driver()
-		self.wait = WebDriverWait(self.driver, self.timeout)
+    # ------------------------------------------------------------------
+    # Conexión al navegador
+    # ------------------------------------------------------------------
 
-		logger.info("WebHandler inicializado y conectado a Brave en 127.0.0.1:9222.")
+    def _create_driver(self) -> webdriver.Chrome:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from webdriver_manager.core.os_manager import ChromeType
+        from selenium.webdriver.chrome.service import Service
 
-	# ------------------------------------------------------------------
-	# Ciclo de vida
-	# ------------------------------------------------------------------
+        options = webdriver.ChromeOptions()
+        options.debugger_address = "127.0.0.1:9222"
+        try:
+            service = Service(
+                ChromeDriverManager(chrome_type=ChromeType.BRAVE).install()
+            )
+            return webdriver.Chrome(service=service, options=options)
+        except Exception:
+            logger.exception("No se pudo conectar a Brave en el puerto 9222.")
+            raise
 
-	def close(self) -> None:
-		"""Cierra el WebDriver sin afectar la ventana de Brave."""
-		if self.driver is not None:
-			self.driver.quit()
+    def _switch_to_sinide_tab(self) -> None:
+        """Cambia el foco de Selenium a la pestaña de SINIDE."""
+        for handle in self.driver.window_handles:
+            self.driver.switch_to.window(handle)
+            if "sge.meducacionsantiago" in self.driver.current_url or \
+               "notas" in self.driver.current_url:
+                logger.info("Pestaña SINIDE encontrada: %s", self.driver.current_url)
+                return
+        # Si no encontramos por URL, usar la última pestaña disponible
+        logger.warning("No se encontró pestaña de SINIDE por URL. Usando la pestaña activa.")
 
-	def __enter__(self) -> "WebHandler":
-		return self
+    def _switch_to_iframe(self) -> None:
+        """Cambia el contexto de Selenium al interior del iframe de notas."""
+        # Primero asegurarse de estar en la pestaña correcta
+        self._switch_to_sinide_tab()
 
-	def __exit__(self, exc_type, exc, tb) -> None:
-		self.close()
+        # Volver al contexto principal del documento
+        self.driver.switch_to.default_content()
 
-	# ------------------------------------------------------------------
-	# Conexión / inicialización
-	# ------------------------------------------------------------------
+        # Esperar a que el iframe esté presente
+        iframe = self.wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, self.sel["iframe"]))
+        )
+        self.driver.switch_to.frame(iframe)
 
-	def _create_driver(self) -> webdriver.Chrome:
-		"""Crea un ChromeDriver conectado a la sesión remota de Brave."""
-		options = webdriver.ChromeOptions()
-		options.debugger_address = "127.0.0.1:9222"
+        # Esperar a que el contenido del iframe cargue (tabla de notas)
+        self.wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table.sge-notas"))
+        )
+        logger.info("Contexto cambiado al iframe. Tabla de notas visible.")
 
-		try:
-			driver = webdriver.Chrome(options=options)
-		except Exception:
-			logger.exception("No se pudo conectar a Brave usando remote debugging en 9222.")
-			raise
+    def _ensure_iframe_context(self) -> None:
+        """Verifica que seguimos dentro del iframe; si no, vuelve a entrar."""
+        try:
+            # Si esto funciona, ya estamos dentro del iframe
+            self.driver.find_element(By.CSS_SELECTOR, "table.sge-notas")
+        except NoSuchElementException:
+            logger.warning("Perdimos el contexto del iframe. Volviendo a entrar...")
+            self._switch_to_iframe()
 
-		logger.info("ChromeDriver conectado correctamente a la sesión remota.")
-		return driver
+    # ------------------------------------------------------------------
+    # Selección de dropdowns Bootstrap
+    # ------------------------------------------------------------------
 
-	# ------------------------------------------------------------------
-	# Selectores y esperas
-	# ------------------------------------------------------------------
+    def select_trimester(self, trimester_name: str) -> None:
+        """Selecciona el trimestre en el dropdown #periodo-notas-selector."""
+        logger.info("Seleccionando trimestre: '%s'.", trimester_name)
+        self._select_bootstrap_dropdown(
+            self.sel["dropdown_trimestre"],
+            self.sel["items_trimestre"],
+            trimester_name,
+        )
+        time.sleep(_TABLE_SETTLE)
 
-	def _wait_for_table(self) -> WebElement:
-		"""Espera hasta que la tabla principal esté presente en la página."""
-		locator = (By.XPATH, self.selectors["tabla_alumnos"])
-		return self.wait.until(EC.presence_of_element_located(locator))
+    def select_subject(self, subject_name: str) -> None:
+        """Selecciona la materia en el dropdown #calificaciones-materias-selector."""
+        logger.info("Seleccionando materia: '%s'.", subject_name)
+        self._select_bootstrap_dropdown(
+            self.sel["dropdown_materia"],
+            self.sel["items_materia"],
+            subject_name,
+        )
+        time.sleep(_TABLE_SETTLE)
 
-	def _get_table_rows(self) -> list[WebElement]:
-		"""Devuelve las filas visibles de la tabla de alumnos."""
-		table = self._wait_for_table()
-		rows = table.find_elements(By.XPATH, self.selectors["fila_alumno"])
+    def _select_bootstrap_dropdown(
+        self, toggle_css: str, items_css: str, target_text: str
+    ) -> None:
+        """
+        Abre un dropdown Bootstrap y hace clic en el item cuyo texto
+        coincida exactamente con target_text.
 
-		if not rows:
-			logger.warning("La tabla fue encontrada, pero no contiene filas visibles.")
+        Los dropdowns de SINIDE tienen esta estructura:
+          <div class="btn-group dropdown">
+            <button class="btn btn-primary dropdown-toggle">...</button>
+            <ul class="dropdown-menu">
+              <li class="clickable"><a><span>TEXTO</span></a></li>
+            </ul>
+          </div>
+        """
+        self._ensure_iframe_context()
 
-		return rows
+        # 1. Abrir el dropdown
+        toggle = self.wait.until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, toggle_css))
+        )
+        toggle.click()
+        time.sleep(0.4)  # esperar animación Bootstrap
 
-	def _wait_for_row_input(self, row: WebElement) -> WebElement:
-		"""Espera a que el input de nota dentro de una fila esté disponible."""
-		locator = (By.XPATH, self.selectors["celda_nota_1t"])
+        # 2. Buscar la opción por texto exacto
+        items = self.wait.until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, items_css))
+        )
 
-		def find_input(_driver: webdriver.Chrome) -> WebElement:
-			return row.find_element(*locator)
+        for item in items:
+            if item.text.strip() == target_text:
+                item.click()
+                logger.debug("Opción '%s' seleccionada.", target_text)
+                return
 
-		return self.wait.until(find_input)
+        raise ValueError(
+            f"No se encontró la opción '{target_text}' en el dropdown. "
+            f"Opciones disponibles: {[i.text.strip() for i in items]}"
+        )
 
-	# ------------------------------------------------------------------
-	# Extracción de datos
-	# ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Lectura de la tabla
+    # ------------------------------------------------------------------
 
-	def get_student_name_from_row(self, row: WebElement) -> str:
-		"""Extrae el nombre del alumno desde una fila de la tabla."""
-		locator = (By.XPATH, self.selectors["celda_nombre"])
-		cell = row.find_element(*locator)
-		student_name = cell.text.strip()
+    def list_web_students(self) -> list[str]:
+        """Devuelve los nombres de alumnos visibles en la tabla."""
+        self._ensure_iframe_context()
+        students = []
+        for row in self._get_rows():
+            try:
+                students.append(self._get_name(row))
+            except (StaleElementReferenceException, ValueError, NoSuchElementException):
+                logger.warning("No se pudo leer una fila; se omite.")
+        return students
 
-		if not student_name:
-			raise ValueError("Se encontró una fila sin nombre de alumno visible.")
+    def _get_rows(self) -> list[WebElement]:
+        """Devuelve las filas <tr> del tbody de la tabla de notas."""
+        self.wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, self.sel["filas_alumnos"]))
+        )
+        rows = self.driver.find_elements(By.CSS_SELECTOR, self.sel["filas_alumnos"])
+        if not rows:
+            logger.warning("La tabla no tiene filas visibles.")
+        return rows
 
-		return student_name
+    def _get_name(self, row: WebElement) -> str:
+        """Extrae el nombre del alumno de la primera celda de la fila."""
+        span = row.find_element(By.CSS_SELECTOR, self.sel["celda_nombre"])
+        name = span.text.strip()
+        if not name:
+            raise ValueError("Fila sin nombre.")
+        return name
 
-	def list_web_students(self) -> list[str]:
-		"""Devuelve los nombres de alumnos visibles en la tabla web."""
-		students: list[str] = []
-		for row in self._get_table_rows():
-			try:
-				students.append(self.get_student_name_from_row(row))
-			except (StaleElementReferenceException, ValueError):
-				logger.warning("No se pudo leer una fila de la tabla; se omite.")
-		return students
+    # ------------------------------------------------------------------
+    # Escritura de notas
+    # ------------------------------------------------------------------
 
-	# ------------------------------------------------------------------
-	# Escritura de notas
-	# ------------------------------------------------------------------
+    def sync_grades(self, grade_resolver: GradeResolver) -> int:
+        """
+        Recorre la tabla fila por fila y escribe las notas.
 
-	def write_grade_in_row(self, row: WebElement, grade: object) -> None:
-		"""Escribe una nota en el input asociado a una fila."""
-		input_element = self._wait_for_row_input(row)
-		grade_text = "" if grade is None else str(grade).strip()
+        Para cada alumno:
+          1. Obtiene el nombre del alumno.
+          2. Llama a grade_resolver(nombre) para obtener la nota.
+          3. Hace clic en el span S/C para activar el input de AngularJS.
+          4. Escribe la nota y confirma con TAB.
 
-		if not grade_text:
-			logger.info("Se omitió una fila porque la nota está vacía.")
-			return
+        Returns:
+            Cantidad de filas actualizadas.
+        """
+        self._ensure_iframe_context()
+        updated = 0
+        rows    = self._get_rows()
 
-		input_element.click()
-		input_element.send_keys(Keys.CONTROL, "a")
-		input_element.send_keys(Keys.BACKSPACE)
-		input_element.send_keys(grade_text)
+        for idx, row in enumerate(rows, 1):
+            try:
+                name  = self._get_name(row)
+                grade = grade_resolver(name)
 
-	def sync_grades(self, grade_resolver: GradeResolver) -> int:
-		"""Recorre la tabla y escribe la nota que devuelva ``grade_resolver``.
+                if not grade or str(grade).strip() == "":
+                    logger.info("[%d/%d] Sin nota para '%s'; omitido.", idx, len(rows), name)
+                    continue
 
-		Args:
-			grade_resolver: Función que recibe el nombre del alumno y devuelve
-				la nota a escribir. Si devuelve ``None`` o una cadena vacía, la
-				fila se omite.
+                self._write_grade(row, grade)
+                updated += 1
+                logger.info("[%d/%d] Nota '%s' escrita para '%s'.", idx, len(rows), grade, name)
 
-		Returns:
-			Cantidad de filas actualizadas.
-		"""
-		updated_rows = 0
-		rows = self._get_table_rows()
+            except StaleElementReferenceException:
+                logger.warning("Fila %d cambió durante el procesamiento; omitida.", idx)
+            except TimeoutException:
+                logger.warning("Timeout esperando input en fila %d; omitida.", idx)
+            except Exception:
+                logger.exception("Error inesperado en fila %d.", idx)
 
-		for index, row in enumerate(rows, start=1):
-			try:
-				student_name = self.get_student_name_from_row(row)
-				grade = grade_resolver(student_name)
+        logger.info("Sync completo: %d/%d filas actualizadas.", updated, len(rows))
+        return updated
 
-				if grade is None or str(grade).strip() == "":
-					logger.info("Sin nota para '%s'; fila %d omitida.", student_name, index)
-					continue
+    def _write_grade(self, row: WebElement, grade: object) -> None:
+        """
+        Escribe una nota en la celda de la fila dada.
 
-				self.write_grade_in_row(row, grade)
-				updated_rows += 1
-				logger.info("Nota escrita para '%s' en la fila %d: %s", student_name, index, grade)
+        Estrategia para el editor AngularJS de SINIDE:
+          1. La celda muestra <span>S/C</span> o el valor anterior.
+          2. Hacer clic en el span activa el modo edición: el span
+             desaparece y aparece un <input>.
+          3. Limpiar el input y escribir la nota.
+          4. Enviar TAB para confirmar y pasar a la siguiente celda.
+        """
+        grade_str = str(grade).strip()
 
-			except StaleElementReferenceException:
-				logger.warning("La fila %d cambió mientras se procesaba; se omite.", index)
-			except TimeoutException:
-				logger.warning("No se pudo localizar el input de nota en la fila %d; se omite.", index)
+        # Paso 1: hacer clic en el span S/C (o valor existente) para abrir el input
+        try:
+            span = row.find_element(By.CSS_SELECTOR, self.sel["celda_nota_sc"])
+            span.click()
+        except NoSuchElementException:
+            # Si ya está en modo edición (input visible), continuar
+            pass
 
-		logger.info("Sincronización finalizada. Filas actualizadas: %d.", updated_rows)
-		return updated_rows
+        # Paso 2: esperar que aparezca el input
+        input_el = WebDriverWait(row, self.timeout).until(
+            lambda r: r.find_element(By.CSS_SELECTOR, self.sel["input_nota"])
+        )
 
-	def fill_note_for_student(self, student_name: str, grade: object) -> bool:
-		"""Busca un alumno por nombre y escribe su nota en la fila correspondiente."""
-		rows = self._get_table_rows()
+        # Paso 3: limpiar y escribir
+        input_el.click()
+        input_el.send_keys(Keys.CONTROL, "a")
+        input_el.send_keys(Keys.DELETE)
+        input_el.send_keys(grade_str)
 
-		for row in rows:
-			try:
-				current_student = self.get_student_name_from_row(row)
-				if current_student.strip().upper() != student_name.strip().upper():
-					continue
-
-				self.write_grade_in_row(row, grade)
-				logger.info("Nota escrita para '%s': %s", student_name, grade)
-				return True
-			except StaleElementReferenceException:
-				logger.warning("La fila del alumno '%s' cambió durante la búsqueda.", student_name)
-				break
-
-		logger.warning("No se encontró la fila del alumno '%s' en la tabla web.", student_name)
-		return False
-
-
-if __name__ == "__main__":
-	try:
-		with WebHandler() as handler:
-			print("WebHandler inicializado correctamente. Conectado a Brave.")
-			print("Alumnos visibles:")
-			for student in handler.list_web_students():
-				print(f"- {student}")
-	except Exception as exc:
-		print(f"\n❌ Error al inicializar WebHandler: {exc}\n")
+        # Paso 4: confirmar con TAB (AngularJS guarda al perder el foco)
+        input_el.send_keys(Keys.TAB)
+        time.sleep(0.3)

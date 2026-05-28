@@ -1,26 +1,45 @@
 {
   "excel_path": "data/notas_colegio.xlsx",
   "columna_alumnos": "NOMBRE ALUMNO",
+
   "mapeo_materias": {
-    "CIENCIAS NATURALES": "Naturales",
-    "CIENCIAS SOCIALES": "Cs Sociales",
-    "EDUCACIÓN FÍSICA": "Educ Fisica",
-    "EDUCACIÓN PLÁSTICA": "Plastica",
+    "CIENCIAS NATURALES":          "Naturales",
+    "CIENCIAS SOCIALES":           "Cs Sociales",
+    "EDUCACIÓN FÍSICA":            "Educ Fisica",
+    "EDUCACIÓN PLÁSTICA":          "Plastica",
     "FORMACIÓN ÉTICA Y CIUDADANA": "Etica",
-    "LENGUA": "Lengua",
-    "MATEMÁTICA": "Matematica",
-    "MÚSICA": "Musica",
-    "TECNOLOGÍA": "Tecnologia"
+    "INGLÉS":                      "Ingles",
+    "LENGUA":                      "Lengua",
+    "MATEMÁTICA":                  "Matematica",
+    "MÚSICA":                      "Musica",
+    "TECNOLOGÍA":                  "Tecnologia"
   },
+
+  "trimestres": {
+    "1er Trimestre":         "1er Trimestre",
+    "2do Trimestre":         "2do Trimestre",
+    "3er Trimestre":         "3er Trimestre",
+    "Evaluación Final":      "Evaluacion Final",
+    "Recup Diciembre":       "Recup Diciembre",
+    "Recup Febrero":         "Recup Febrero",
+    "Evaluación Definitiva": "Evaluacion Definitiva"
+  },
+
   "selenium": {
-    "timeout_segundos": 10,
+    "timeout_segundos": 15,
     "selectores": {
-      "tabla_alumnos": "//table[@class='ui-table-textbox']",
-      "fila_alumno": ".//tr[contains(@class, 'ui-widget-content')]",
-      "celda_nombre": ".//td[1]",
-      "celda_nota_1t": ".//td[2]/input",
-      "desplegable_materia": "//button[contains(@class, 'ui-dropdown-trigger')]",
-      "opciones_materia": "//li[contains(@class, 'ui-dropdown-item')]"
+      "iframe":              "iframe",
+
+      "dropdown_materia":    "#calificaciones-materias-selector button.dropdown-toggle",
+      "items_materia":       "#calificaciones-materias-selector ul.dropdown-menu li.clickable a span",
+
+      "dropdown_trimestre":  "#periodo-notas-selector button.dropdown-toggle",
+      "items_trimestre":     "#periodo-notas-selector ul.dropdown-menu li.clickable a span",
+
+      "filas_alumnos":       "table.sge-notas tbody tr",
+      "celda_nombre":        "td:first-child persona-nombre span",
+      "celda_nota_sc":       "td.nota-alumno nota-celda div.nota-celda span",
+      "input_nota":          "td.nota-alumno nota-celda div.nota-celda input"
     }
   }
 }

@@ -1,125 +1,155 @@
 """main.py
 ---------
-Punto de entrada para sincronizar calificaciones entre el Excel y SINIDE.
+Orquestador: itera sobre trimestres y materias, selecciona los dropdowns
+en la web y sincroniza las notas desde el Excel.
 
-El script carga una pestaña del Excel, se conecta a una sesión ya abierta de
-Brave mediante remote debugging y recorre los alumnos visibles en la tabla
-web para escribir la nota correspondiente en cada fila.
+Uso
+---
+    # Probar una materia en un trimestre (recomendado para el primer test):
+    python src/main.py "MATEMÁTICA" --trimestre "1er Trimestre"
+
+    # Todas las materias en un trimestre:
+    python src/main.py --trimestre "1er Trimestre"
+
+    # Una materia en todos los trimestres:
+    python src/main.py "MATEMÁTICA"
+
+    # Todo (todas las materias, todos los trimestres):
+    python src/main.py
+
+Requisito previo
+----------------
+    brave-browser --remote-debugging-port=9222
+Luego loguearse en SINIDE y navegar hasta Calificaciones. Después correr este script.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-from pathlib import Path
-from typing import Sequence
-
-import pandas as pd
+import sys
+from typing import Optional, Sequence
 
 from excel_reader import ExcelReader
 from web_handler import WebHandler
 
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# Solo estos trimestres tienen notas para cargar
+TRIMESTRES_CARGABLES = [
+    "1er Trimestre",
+    "2do Trimestre",
+    "3er Trimestre",
+    "Evaluación Final",
+]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-	"""Construye el parser de línea de comandos del script."""
-	parser = argparse.ArgumentParser(
-		description="Sincroniza calificaciones desde Excel hacia SINIDE.",
-	)
-	parser.add_argument(
-		"subject",
-		help="Nombre de la materia según config.json, por ejemplo 'CIENCIAS NATURALES'.",
-	)
-	parser.add_argument(
-		"--sheet",
-		dest="sheet_name",
-		help="Nombre de la pestaña del Excel a cargar. Si se omite, se usa la primera hoja disponible.",
-	)
-	return parser
+    parser = argparse.ArgumentParser(
+        description="Sincroniza calificaciones desde Excel hacia SINIDE.",
+    )
+    parser.add_argument(
+        "subject",
+        nargs="?",
+        default=None,
+        help="Nombre de la materia (ej: 'MATEMÁTICA'). Si se omite, se procesan todas.",
+    )
+    parser.add_argument(
+        "--trimestre", "-t",
+        dest="trimestre",
+        default=None,
+        help="Nombre del trimestre (ej: '1er Trimestre'). Si se omite, se procesan todos.",
+    )
+    return parser
 
 
-def get_available_sheets(excel_path: Path) -> list[str]:
-	"""Devuelve las pestañas disponibles en el archivo Excel."""
-	return pd.ExcelFile(excel_path).sheet_names
+# ---------------------------------------------------------------------------
+# Lógica principal
+# ---------------------------------------------------------------------------
+
+def run(subject: Optional[str], trimestre: Optional[str]) -> int:
+    reader = ExcelReader()
+
+    subjects   = [subject]   if subject   else reader.list_subjects()
+    trimestres = [trimestre] if trimestre else TRIMESTRES_CARGABLES
+
+    # Validaciones previas
+    for s in subjects:
+        if s not in reader.list_subjects():
+            logger.error("Materia '%s' no está en config.json. Disponibles: %s", s, reader.list_subjects())
+            return 1
+
+    for t in trimestres:
+        if t not in reader.list_trimesters():
+            logger.error("Trimestre '%s' no está en config.json. Disponibles: %s", t, reader.list_trimesters())
+            return 1
+
+    total_updated = 0
+
+    with WebHandler() as wh:
+        for trimestre_actual in trimestres:
+            logger.info("=" * 50)
+            logger.info("TRIMESTRE: %s", trimestre_actual)
+            logger.info("=" * 50)
+
+            # Cargar la pestaña del Excel para este trimestre
+            try:
+                reader.load_sheet(trimestre_actual)
+            except (FileNotFoundError, ValueError) as exc:
+                logger.error("No se pudo cargar el Excel para '%s': %s", trimestre_actual, exc)
+                continue
+
+            for materia_actual in subjects:
+                logger.info("--- Materia: %s ---", materia_actual)
+
+                # 1. Primero materia (esto habilita el dropdown de trimestre)
+                try:
+                    wh.select_subject(materia_actual)
+                except Exception as exc:
+                    logger.error("No se pudo seleccionar materia '%s': %s", materia_actual, exc)
+                    continue
+
+                # 2. Luego trimestre
+                try:
+                    wh.select_trimester(trimestre_actual)
+                except Exception as exc:
+                    logger.error("No se pudo seleccionar trimestre '%s': %s", trimestre_actual, exc)
+                    continue
+
+                # Sincronizar notas
+                grade_resolver = lambda name, s=materia_actual: reader.get_grade(name, s)
+                updated = wh.sync_grades(grade_resolver)
+                total_updated += updated
+
+    logger.info("=" * 50)
+    logger.info("FIN. Total de notas cargadas: %d", total_updated)
+    logger.info("=" * 50)
+    return 0
 
 
-def resolve_sheet_name(requested_sheet: str | None, available_sheets: Sequence[str]) -> str:
-	"""Elige la pestaña a cargar a partir de un valor pedido o el primer nombre disponible."""
-	if not available_sheets:
-		raise ValueError("El archivo Excel no contiene pestañas disponibles.")
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
-	if requested_sheet:
-		if requested_sheet not in available_sheets:
-			raise ValueError(
-				f"La pestaña '{requested_sheet}' no existe. Disponibles: {list(available_sheets)}"
-			)
-		return requested_sheet
-
-	return available_sheets[0]
-
-
-def run(subject: str, sheet_name: str | None = None) -> int:
-	"""Ejecuta la sincronización completa de notas."""
-	excel_reader = ExcelReader()
-
-	available_sheets = get_available_sheets(excel_reader.excel_path)
-	resolved_sheet = resolve_sheet_name(sheet_name, available_sheets)
-
-	logger.info("Cargando pestaña '%s' del Excel.", resolved_sheet)
-	excel_reader.load_sheet(resolved_sheet)
-
-	if subject not in excel_reader.list_subjects():
-		raise KeyError(
-			f"La materia '{subject}' no está definida en config.json. "
-			f"Materias disponibles: {excel_reader.list_subjects()}"
-		)
-
-	with WebHandler() as web_handler:
-		web_students = web_handler.list_web_students()
-		logger.info("Se detectaron %d alumnos visibles en la web.", len(web_students))
-
-		updated_rows = 0
-
-		for index, student_name in enumerate(web_students, start=1):
-			logger.info("Procesando alumno %d/%d: %s", index, len(web_students), student_name)
-
-			try:
-				grade = excel_reader.get_grade(student_name, subject)
-			except Exception:
-				logger.exception("No se pudo resolver la nota para '%s'.", student_name)
-				continue
-
-			if grade is None or str(grade).strip() == "":
-				logger.info("El alumno '%s' no tiene nota cargada; se omite.", student_name)
-				continue
-
-			if web_handler.fill_note_for_student(student_name, grade):
-				updated_rows += 1
-			else:
-				logger.warning("No se pudo escribir la nota para '%s'.", student_name)
-
-		logger.info(
-			"Sincronización completada. Filas actualizadas: %d de %d.",
-			updated_rows,
-			len(web_students),
-		)
-
-	return 0
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-	"""Punto de entrada CLI."""
-	parser = build_parser()
-	args = parser.parse_args(argv)
-
-	try:
-		return run(subject=args.subject, sheet_name=args.sheet_name)
-	except Exception as exc:
-		logger.exception("La sincronización terminó con error: %s", exc)
-		return 1
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return run(subject=args.subject, trimestre=args.trimestre)
+    except KeyboardInterrupt:
+        logger.info("Interrumpido por el usuario.")
+        return 0
+    except Exception as exc:
+        logger.exception("Error inesperado: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":
-	raise SystemExit(main())
+    sys.exit(main())
