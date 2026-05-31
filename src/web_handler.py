@@ -289,12 +289,12 @@ class WebHandler:
         """
         grade_str = str(grade).strip()
 
-        # Paso 1: hacer clic en el span S/C (o valor existente) para abrir el input
+        # Paso 1: hacer clic en el span S/C usando JavaScript
+        # (evita ElementClickInterceptedException cuando nota-readonly tapa el span)
         try:
             span = row.find_element(By.CSS_SELECTOR, self.sel["celda_nota_sc"])
-            span.click()
+            self.driver.execute_script("arguments[0].click();", span)
         except NoSuchElementException:
-            # Si ya está en modo edición (input visible), continuar
             pass
 
         # Paso 2: esperar que aparezca el input
@@ -311,3 +311,48 @@ class WebHandler:
         # Paso 4: confirmar con TAB (AngularJS guarda al perder el foco)
         input_el.send_keys(Keys.TAB)
         time.sleep(0.3)
+
+    def select_trimester_with_retry(self, trimester_name: str, max_intentos: int = 4) -> bool:
+        """
+        Selecciona el trimestre y verifica que aparezca la columna 'Nota Final'
+        con inputs editables. Si no aparece, reintenta hasta max_intentos veces.
+
+        Bug de SINIDE: a veces al seleccionar materia+trimestre la tabla carga
+        pero sin la columna de notas editable. Re-seleccionar el trimestre lo soluciona.
+
+        Returns:
+            True si la columna de notas quedó disponible, False si agotó los intentos.
+        """
+        for intento in range(1, max_intentos + 1):
+            self.select_trimester(trimester_name)
+
+            if self._columna_notas_disponible():
+                if intento > 1:
+                    logger.info("Columna de notas disponible tras %d intento(s).", intento)
+                return True
+
+            logger.warning(
+                "Intento %d/%d: columna 'Nota Final' sin inputs. Re-seleccionando trimestre...",
+                intento, max_intentos,
+            )
+            time.sleep(1.5)
+
+        logger.error(
+            "No se pudo activar la columna de notas para '%s' tras %d intentos. Se omite.",
+            trimester_name, max_intentos,
+        )
+        return False
+
+    def _columna_notas_disponible(self) -> bool:
+        """
+        Verifica que la tabla tenga spans S/C o inputs visibles en la columna de nota,
+        lo que indica que la columna 'Nota Final' está lista para editar.
+        """
+        try:
+            elementos = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                f"{self.sel['celda_nota_sc']}, {self.sel['input_nota']}"
+            )
+            return len(elementos) > 0
+        except Exception:
+            return False

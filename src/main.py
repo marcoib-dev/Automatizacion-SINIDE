@@ -45,6 +45,9 @@ TRIMESTRES_CARGABLES = [
     "2do Trimestre",
     "3er Trimestre",
     "Evaluación Final",
+    "Recup Diciembre",
+    "Recup Febrero",
+    "Evaluación Definitiva",
 ]
 
 
@@ -110,16 +113,18 @@ def run(subject: Optional[str], trimestre: Optional[str]) -> int:
             for materia_actual in subjects:
                 logger.info("--- Materia: %s ---", materia_actual)
 
-                # 1. Primero materia (esto habilita el dropdown de trimestre)
+                # 1. Primero seleccionar la materia
                 try:
                     wh.select_subject(materia_actual)
                 except Exception as exc:
                     logger.error("No se pudo seleccionar materia '%s': %s", materia_actual, exc)
                     continue
 
-                # 2. Luego trimestre
+                # 2. Luego seleccionar el trimestre
                 try:
-                    wh.select_trimester(trimestre_actual)
+                    ok = wh.select_trimester_with_retry(trimestre_actual)
+                    if not ok:
+                        continue
                 except Exception as exc:
                     logger.error("No se pudo seleccionar trimestre '%s': %s", trimestre_actual, exc)
                     continue
@@ -128,6 +133,11 @@ def run(subject: Optional[str], trimestre: Optional[str]) -> int:
                 grade_resolver = lambda name, s=materia_actual: reader.get_grade(name, s)
                 updated = wh.sync_grades(grade_resolver)
                 total_updated += updated
+
+                logger.info(
+                    "✓ %s | %s: %d notas cargadas.",
+                    trimestre_actual, materia_actual, updated,
+                )
 
     logger.info("=" * 50)
     logger.info("FIN. Total de notas cargadas: %d", total_updated)
